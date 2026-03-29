@@ -16,7 +16,6 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import schedulefree
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -248,29 +247,23 @@ class GPT(nn.Module):
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        # RAdamScheduleFree for non-matrix params (no warmup/schedule needed)
-        sf_param_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, weight_decay=0.0),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale, weight_decay=0.0),
-            dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, weight_decay=0.0),
-            dict(params=resid_params, lr=scalar_lr * 0.01, weight_decay=0.0),
-            dict(params=x0_params, lr=scalar_lr, weight_decay=0.0),
+        param_groups = [
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        sf_optimizer = schedulefree.RAdamScheduleFree(
-            sf_param_groups, lr=1.0, betas=adam_betas, eps=1e-10,
-        )
-        # Muon for 2D matrix params (keeps its own schedule)
-        muon_groups = []
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            muon_groups.append(dict(
+            param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
-        muon_optimizer = MuonAdamW(muon_groups)
-        for group in muon_optimizer.param_groups:
+        optimizer = MuonAdamW(param_groups)
+        for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
-        return sf_optimizer, muon_optimizer
+        return optimizer
 
     def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
@@ -503,7 +496,7 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-sf_optimizer, muon_optimizer = model.setup_optimizer(
+optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
     scalar_lr=SCALAR_LR,
@@ -547,8 +540,6 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
-sf_optimizer.train()  # schedule-free: switch params to y (gradient evaluation point)
-
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
@@ -560,18 +551,17 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Muon schedule (still needs LR warmdown)
+    # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
-    for group in muon_optimizer.param_groups:
+    for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        group["momentum"] = muon_momentum
-        group["weight_decay"] = muon_weight_decay
-    # Step both optimizers
-    sf_optimizer.step()
-    muon_optimizer.step()
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+    optimizer.step()
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -617,8 +607,7 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval — schedule-free: switch params to x (averaged point) for eval
-sf_optimizer.eval()
+# Final eval
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
