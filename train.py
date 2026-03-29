@@ -16,7 +16,6 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import schedulefree
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -235,8 +234,7 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.9, 0.999), scalar_lr=0.5,
-                        warmup_steps=50):
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -249,33 +247,23 @@ class GPT(nn.Module):
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        # Schedule-Free AdamW for embedding/scalar params (no LR schedule needed)
-        sf_param_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, weight_decay=0.0),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale, weight_decay=0.0),
-            dict(params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, weight_decay=0.0),
-            dict(params=resid_params, lr=scalar_lr * 0.01, weight_decay=0.0),
-            dict(params=x0_params, lr=scalar_lr, weight_decay=0.0),
+        param_groups = [
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        sf_optimizer = schedulefree.AdamWScheduleFree(
-            sf_param_groups,
-            lr=1.0,  # per-group LRs override this
-            betas=adam_betas,
-            eps=1e-10,
-            warmup_steps=warmup_steps,
-        )
-        # Muon for 2D matrix params (keeps its own schedule)
-        muon_groups = []
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            muon_groups.append(dict(
+            param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
-        muon_optimizer = MuonAdamW(muon_groups)
-        for group in muon_optimizer.param_groups:
+        optimizer = MuonAdamW(param_groups)
+        for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
-        return sf_optimizer, muon_optimizer
+        return optimizer
 
     def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
@@ -453,7 +441,7 @@ UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.9, 0.999) # Schedule-Free betas (default, more stable than 0.8/0.95)
+ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
@@ -508,14 +496,13 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-sf_optimizer, muon_optimizer = model.setup_optimizer(
+optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
     scalar_lr=SCALAR_LR,
     adam_betas=ADAM_BETAS,
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
-    warmup_steps=50,
 )
 
 model = torch.compile(model, dynamic=False)
@@ -553,8 +540,6 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
-sf_optimizer.train()  # schedule-free: switch params to y (gradient evaluation point)
-
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
@@ -566,18 +551,17 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Muon schedule (still needs LR warmdown)
+    # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
-    for group in muon_optimizer.param_groups:
+    for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        group["momentum"] = muon_momentum
-        group["weight_decay"] = muon_weight_decay
-    # Step both optimizers
-    sf_optimizer.step()
-    muon_optimizer.step()
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+    optimizer.step()
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -623,8 +607,7 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval — schedule-free: switch params to x (averaged point) for eval
-sf_optimizer.eval()
+# Final eval
 model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
