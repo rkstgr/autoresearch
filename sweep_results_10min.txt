@@ -1,0 +1,9 @@
+ScheduleFree 10-Minute Sweep Results
+TIME_BUDGET = 600s
+Baseline (10min): 0.990556
+Baseline (5min): 1.033362
+======================================================================
+baseline_10min                      | val_bpb=0.990556 (delta=+0.000000) | Baseline Muon+AdamW at 10min budget
+sf01_adamw_r075_15x_10min           | val_bpb=1.00995 (delta=+0.019394) | AdamWScheduleFree r=0.75, betas=(0.8,0.95), 1.5x LR, warmup=20 @ 10min
+sf03_adamw_r075_2x_10min            | val_bpb=1.009197 (delta=+0.018641) | AdamWScheduleFree r=0.75, betas=(0.8,0.95), 2x LR, warmup=20 @ 10min
+======================================================================

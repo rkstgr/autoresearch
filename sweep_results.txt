@@ -1,0 +1,9 @@
+ScheduleFree Sweep Results
+Baseline: val_bpb = 1.033362
+======================================================================
+sf01_adamw_r075_15x            | val_bpb=1.044509 (+0.011147) | AdamWScheduleFree r=0.75, betas=(0.8,0.95), 1.5x LR, warmup=20
+sf02_radam_r075_15x            | val_bpb=1.045855 (+0.012493) | RAdamScheduleFree r=0.75, betas=(0.8,0.95), 1.5x LR
+sf03_adamw_r075_2x             | val_bpb=1.044572 (+0.011210) | AdamWScheduleFree r=0.75, betas=(0.8,0.95), 2x LR, warmup=20
+sf04_algoperf                  | val_bpb=1.072847 (+0.039485) | AlgoPerf-winning params: betas=(0.9,0.9955), r=0.75, wd=0.08, 1.5x LR
+sf05_adamw_r075_1x             | val_bpb=1.045725 (+0.012363) | AdamWScheduleFree r=0.75, betas=(0.8,0.95), 1x LR (no scale), warmup=20
+======================================================================
